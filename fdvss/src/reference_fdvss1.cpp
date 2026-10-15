@@ -1,0 +1,597 @@
+#include "fdvss/reference.hpp"
+
+#include <algorithm>
+#include <numeric>
+#include <stdexcept>
+#include <utility>
+
+namespace fdvss::reference {
+namespace {
+
+using Indices = std::vector<std::size_t>;
+using Complaints = std::vector<Indices>;
+
+// Records have a presence byte and, when present, a uint64 coefficient count.
+// Index sets have a uint64 count followed by uint64 indices. No transport
+// headers are included. Malformed records are counted as the records sent.
+std::uint64_t record_bytes(const Record& record) {
+    return record ? 9 + 8 * record->size() : 1;
+}
+
+std::uint64_t set_bytes(const Indices& indices) {
+    return 8 + 8 * indices.size();
+}
+
+std::uint64_t complaints_bytes(const std::optional<Complaints>& complaints) {
+    if (!complaints) return 1;
+    std::uint64_t bytes = 9;
+    for (const auto& indices : *complaints) bytes += set_bytes(indices);
+    return bytes;
+}
+
+void broadcast(Result& result, std::uint64_t bytes, std::size_t n) {
+    result.communication.broadcast_native_bytes += bytes;
+    result.communication.broadcast_materialized_bytes += bytes * n;
+}
+
+bool valid_indices(const Indices& indices, std::size_t n) {
+    for (std::size_t index = 0; index < indices.size(); ++index) {
+        if (indices[index] >= n || (index != 0 && indices[index - 1] >= indices[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Indices all_indices(std::size_t n) {
+    Indices indices(n);
+    std::iota(indices.begin(), indices.end(), 0);
+    return indices;
+}
+
+bool contains(const Indices& indices, std::size_t index) {
+    return std::binary_search(indices.begin(), indices.end(), index);
+}
+
+template <class T>
+std::optional<T> majority(const std::vector<std::optional<T>>& messages, std::size_t threshold) {
+    for (const auto& message : messages) {
+        if (!message) continue;
+        const std::size_t count = std::count(messages.begin(), messages.end(), message);
+        if (count >= threshold) return message;
+    }
+    return std::nullopt;
+}
+
+Polynomial eval_axis(const Polynomial& coefficients, std::size_t width, Fp point) {
+    return evaluate(Decoded{coefficients, {}, width}, point);
+}
+
+Polynomial constant_term(const Polynomial& coefficients, std::size_t width) {
+    return Polynomial(coefficients.begin(), coefficients.begin() + width);
+}
+
+Record valid_record(const Record& record, std::size_t width) {
+    return record && record->size() == width ? record : std::nullopt;
+}
+
+std::optional<Decoded> decode_records(
+    std::vector<Record> records, std::size_t width, std::size_t t,
+    std::size_t threshold, Result& result
+) {
+    for (auto& record : records) record = valid_record(record, width);
+    auto polynomial = decode(records, t, threshold);
+    if (!polynomial) ++result.decoder_failures;
+    return polynomial;
+}
+
+Record reconstruct_records(
+    const std::vector<Record>& records, std::size_t width, std::size_t t,
+    std::size_t threshold, Result& result
+) {
+    const auto polynomial = decode_records(records, width, t, threshold, result);
+    return polynomial ? Record(evaluate(*polynomial, Fp::zero())) : std::nullopt;
+}
+
+std::vector<Record> shamir_share(const Record& secret, std::size_t n, std::size_t t, SplitMix64& rng) {
+    std::vector<Record> shares(n);
+    if (!secret) return shares;
+    const std::size_t width = secret->size();
+    Polynomial polynomial((t + 1) * width);
+    std::copy(secret->begin(), secret->end(), polynomial.begin());
+    for (std::size_t coefficient = width; coefficient < polynomial.size(); ++coefficient) {
+        polynomial[coefficient] = rng.next_field();
+    }
+    for (std::size_t recipient = 0; recipient < n; ++recipient) {
+        shares[recipient] = eval_axis(polynomial, width, Fp::from_u64(recipient + 1));
+    }
+    return shares;
+}
+
+struct Public3 {
+    std::optional<Complaints> complaints;
+    bool r_success = false;
+    Record complete_vector;
+    std::vector<Record> column_vectors;
+};
+
+struct Forward4 {
+    std::optional<bool> qualified;
+    std::optional<Indices> supporters;
+    std::optional<Indices> unhappy;
+    std::vector<Record> repair_shares;  // [i][k], delivered by this l.
+};
+
+struct Faults {
+    bool row = false;
+    bool malformed_row = false;
+    bool all_malformed = false;
+    bool column = false;
+    bool committee3 = false;
+    bool committee3_values = false;
+    bool committee4 = false;
+    bool inconsistent_dealer = false;
+    bool repair_failure_diagnostic = false;
+    bool status_failure_diagnostic = false;
+};
+
+Faults faults_for(const std::string& scenario) {
+    Faults faults;
+    if (scenario == "honest") return faults;
+    if (scenario == "bad-row") faults.row = true;
+    else if (scenario == "malformed-row") faults.malformed_row = true;
+    else if (scenario == "all-malformed-rows") faults.all_malformed = true;
+    else if (scenario == "bad-com2") faults.column = true;
+    else if (scenario == "bad-com3") faults.committee3 = true;
+    else if (scenario == "bad-com3-values") {
+        faults.row = true;
+        faults.committee3_values = true;
+    }
+    else if (scenario == "bad-com4") faults.committee4 = true;
+    else if (scenario == "combined") {
+        faults.row = faults.column = faults.committee3 = faults.committee4 = true;
+    } else if (scenario == "inconsistent-dealer" || scenario == "decoder-failure") {
+        faults.inconsistent_dealer = true;
+    } else if (scenario == "repair-decoder-failure-diagnostic") {
+        faults.row = true;
+        faults.repair_failure_diagnostic = true;
+    } else if (scenario == "status-quorum-failure-diagnostic") {
+        faults.status_failure_diagnostic = true;
+    } else {
+        throw std::invalid_argument("unknown FDVSS-1 reference scenario: " + scenario);
+    }
+    return faults;
+}
+
+}  // namespace
+
+std::vector<std::string> fdvss1_scenarios() {
+    return {"honest", "bad-row", "malformed-row", "all-malformed-rows", "bad-com2",
+            "bad-com3", "bad-com3-values", "bad-com4", "combined", "inconsistent-dealer", "decoder-failure",
+            "repair-decoder-failure-diagnostic", "status-quorum-failure-diagnostic"};
+}
+
+Result run_fdvss1(const Config& config, const std::string& scenario) {
+    const std::size_t n = config.n;
+    const std::size_t t = config.t;
+    if (n == 0 || t >= n || t > (n - 1) / 3) {
+        throw std::invalid_argument("FDVSS-1 reference execution requires n > 3t");
+    }
+    const Faults faults = faults_for(scenario);
+    if (t == 0 && scenario != "honest") {
+        throw std::invalid_argument("FDVSS-1 fault scenarios require t >= 1");
+    }
+    const std::size_t d = t + 1;
+    const std::size_t threshold = n - t;
+    const auto points = evaluation_points(n);
+    SplitMix64 rng(config.seed);
+    Result result;
+    result.protocol = "fdvss1";
+    result.scenario = scenario;
+    result.shares.resize(n, Fp::zero());
+
+    // The expected sharing is used only after execution as a test oracle.
+    Polynomial dealer_polynomial(d * d * d * d);
+    for (auto& coefficient : dealer_polynomial) coefficient = rng.next_field();
+    const Polynomial expected_secret_z(dealer_polynomial.begin(), dealer_polynomial.begin() + d);
+    std::vector<Fp> expected_shares(n);
+    for (std::size_t v = 0; v < n; ++v) {
+        expected_shares[v] = evaluate_polynomial(expected_secret_z, points[v]);
+    }
+    if (faults.all_malformed || faults.inconsistent_dealer || faults.repair_failure_diagnostic
+        || faults.status_failure_diagnostic) {
+        std::fill(expected_shares.begin(), expected_shares.end(), Fp::zero());
+    }
+    const bool expected_qualified = !faults.inconsistent_dealer && !faults.repair_failure_diagnostic
+        && !faults.status_failure_diagnostic;
+    const auto finish = [&]() {
+        result.verified = result.qualified == expected_qualified && result.shares == expected_shares;
+        return result;
+    };
+
+    // Dealer -> Com_1. A malformed row is transmitted, then interpreted by
+    // the recipient; it is not repaired with a copy of the dealer polynomial.
+    std::vector<Record> rows(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        rows[i] = eval_axis(dealer_polynomial, d * d * d, points[i]);
+        if (faults.inconsistent_dealer) {
+            // Degree t+1 in W has at most t+1 agreements with any degree-t
+            // polynomial, fewer than n-t. Each delivered cubic row is valid.
+            (*rows[i])[0] += points[i].pow(t + 1);
+        }
+        if (faults.malformed_row && i == 0) rows[i] = Polynomial(d * d * d - 1);
+        if (faults.all_malformed) rows[i] = std::nullopt;
+        result.communication.p2p_bytes += record_bytes(rows[i]);
+    }
+
+    // Com_1 -> Com_2: send every row evaluation, with zero fallback for an
+    // invalid dealer row. Corrupt positions send a different valid cubic row.
+    std::vector<Record> a(n * n);  // [i][j], polynomial in Y,Z.
+    for (std::size_t i = 0; i < n; ++i) {
+        Polynomial row = valid_record(rows[i], d * d * d).value_or(Polynomial(d * d * d));
+        if (faults.row && i < t) row[0] += Fp::from_u64(i + 1);
+        for (std::size_t j = 0; j < n; ++j) {
+            a[i * n + j] = eval_axis(row, d * d, points[j]);
+            result.communication.p2p_bytes += record_bytes(a[i * n + j]);
+        }
+    }
+
+    // Com_2: decode columns, broadcast complaints, and forward raw records.
+    Complaints complaints(n);
+    std::vector<Record> raw(n * n * n);  // [i][j][k], polynomial in Z.
+    const auto raw_index = [n](std::size_t i, std::size_t j, std::size_t k) {
+        return (i * n + j) * n + k;
+    };
+    for (std::size_t j = 0; j < n; ++j) {
+        std::vector<Record> column(n);
+        for (std::size_t i = 0; i < n; ++i) column[i] = a[i * n + j];
+        const auto q = decode_records(column, d * d, t, threshold, result);
+        if (!q) complaints[j] = all_indices(n);
+        else {
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!column[i] || *column[i] != evaluate(*q, points[i])) complaints[j].push_back(i);
+            }
+        }
+        if (faults.column && j < t) complaints[j] = {n};  // Malformed broadcast.
+        broadcast(result, set_bytes(complaints[j]), n);
+        for (std::size_t k = 0; k < n; ++k) {
+            for (std::size_t i = 0; i < n; ++i) {
+                Record value;
+                if (const auto entry = valid_record(a[i * n + j], d * d)) {
+                    value = eval_axis(*entry, d, points[k]);
+                }
+                if (faults.column && j < t) {
+                    // The same corrupt j can omit, malform, or alter private
+                    // records, without changing any honest party's rules.
+                    if (j % 2 == 0) value = std::nullopt;
+                    else if (value) (*value)[0] += Fp::one();
+                }
+                raw[raw_index(i, j, k)] = value;
+                result.communication.p2p_bytes += record_bytes(value);
+            }
+        }
+    }
+
+    // Every honest Com_3 party applies the same complaint normalization to
+    // the authenticated native broadcast. Malformed sets become [n].
+    for (auto& indices : complaints) {
+        if (!valid_indices(indices, n)) indices = all_indices(n);
+        result.complaints += indices.size();
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> edges;
+    std::vector<std::vector<std::size_t>> edge_positions(n);
+    for (std::size_t j = 0; j < n; ++j) {
+        for (const std::size_t i : complaints[j]) {
+            edge_positions[j].push_back(edges.size());
+            edges.emplace_back(i, j);
+        }
+    }
+
+    // Com_3: all two-axis decoders, the complete public vectors, and two
+    // independent Shamir sharings. A failed decoder becomes an erasure.
+    std::vector<Public3> public3(n);
+    std::vector<Record> h0(n * n * n), h1(n * n * n);  // [i][k][l].
+    const auto h_index = [n](std::size_t i, std::size_t k, std::size_t l) {
+        return (i * n + k) * n + l;
+    };
+    for (std::size_t k = 0; k < n; ++k) {
+        std::vector<std::optional<Decoded>> qhat(n), u(n);
+        for (std::size_t j = 0; j < n; ++j) {
+            std::vector<Record> column(n);
+            for (std::size_t i = 0; i < n; ++i) column[i] = raw[raw_index(i, j, k)];
+            qhat[j] = decode_records(column, d, t, threshold, result);
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            std::vector<Record> row(n);
+            for (std::size_t j = 0; j < n; ++j) row[j] = raw[raw_index(i, j, k)];
+            u[i] = decode_records(row, d, t, threshold, result);
+        }
+        std::vector<Record> u_coefficients(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (u[i]) u_coefficients[i] = u[i]->coefficients;
+        }
+        const auto r = decode_records(u_coefficients, d * d, t, threshold, result);
+        auto& outgoing = public3[k];
+        outgoing.complaints = complaints;
+        outgoing.r_success = r.has_value();
+        outgoing.column_vectors.resize(n);
+        if (r) {
+            Polynomial complete;
+            complete.reserve(edges.size() * d);
+            for (const auto& [i, j] : edges) {
+                const auto at_i = evaluate(*r, points[i]);
+                const auto at_ij = eval_axis(at_i, d, points[j]);
+                complete.insert(complete.end(), at_ij.begin(), at_ij.end());
+            }
+            outgoing.complete_vector = std::move(complete);
+        }
+        for (std::size_t j = 0; j < n; ++j) {
+            if (!qhat[j]) continue;
+            Polynomial entries;
+            for (const std::size_t i : complaints[j]) {
+                const auto entry = evaluate(*qhat[j], points[i]);
+                entries.insert(entries.end(), entry.begin(), entry.end());
+            }
+            outgoing.column_vectors[j] = std::move(entries);
+        }
+        if (faults.committee3 && k < t) {
+            outgoing.r_success = false;
+            outgoing.complete_vector = std::nullopt;
+            for (auto& entries : outgoing.column_vectors) entries = std::nullopt;
+            // A malformed echo cannot determine the public complaint table.
+            outgoing.complaints = std::nullopt;
+        }
+        if (faults.committee3_values && k < t) {
+            // bad-row makes E nonempty. These records retain the proper
+            // dimensions and success flags; public BW must correct values.
+            if (outgoing.complete_vector && !outgoing.complete_vector->empty()) {
+                (*outgoing.complete_vector)[0] += Fp::one();
+            }
+            for (auto& entries : outgoing.column_vectors) {
+                if (entries && !entries->empty()) (*entries)[0] += Fp::one();
+            }
+        }
+        std::uint64_t public_bytes = complaints_bytes(outgoing.complaints) + 1
+            + record_bytes(outgoing.complete_vector);
+        for (const auto& entries : outgoing.column_vectors) {
+            public_bytes += 1 + record_bytes(entries);  // Column validity byte.
+        }
+        broadcast(result, public_bytes, n);
+        for (std::size_t i = 0; i < n; ++i) {
+            Record secret0, secret1;
+            if (r) secret0 = constant_term(evaluate(*r, points[i]), d);
+            if (u[i]) secret1 = constant_term(u[i]->coefficients, d);
+            // The calls draw distinct random coefficients even for equal
+            // secrets, as required by the protocol's independent sharing.
+            auto shares0 = shamir_share(secret0, n, t, rng);
+            auto shares1 = shamir_share(secret1, n, t, rng);
+            for (std::size_t l = 0; l < n; ++l) {
+                if (faults.committee3 && k < t) {
+                    shares0[l] = std::nullopt;
+                    shares1[l] = std::nullopt;
+                }
+                if (faults.committee3_values && k < t) {
+                    // Coherent wrong resharings pass the inner L decoder.
+                    // The outer K decoder, or S-filtered public repair,
+                    // must eliminate their incorrect secret values.
+                    if (shares0[l]) (*shares0[l])[0] += Fp::one();
+                    if (shares1[l]) (*shares1[l])[0] += Fp::one();
+                }
+                h0[h_index(i, k, l)] = shares0[l];
+                h1[h_index(i, k, l)] = shares1[l];
+                result.communication.p2p_bytes += record_bytes(shares0[l]) + record_bytes(shares1[l]);
+            }
+        }
+    }
+
+    // Com_4's public view is common to every honest recipient. Compute it
+    // once, then deliver each l's actual private/public forwarding records.
+    bool qualified = true;
+    std::vector<std::optional<Complaints>> complaint_echoes(n);
+    for (std::size_t k = 0; k < n; ++k) {
+        const auto& candidate = public3[k].complaints;
+        if (candidate && candidate->size() == n && std::all_of(candidate->begin(), candidate->end(),
+            [n](const auto& indices) { return valid_indices(indices, n); })) {
+            complaint_echoes[k] = candidate;
+        }
+    }
+    const auto recovered_complaints = majority(complaint_echoes, threshold);
+    if (!recovered_complaints) {
+        ++result.decoder_failures;
+        qualified = false;
+    }
+    std::optional<Decoded> p;
+    Indices supporters, happy, unhappy;
+    if (qualified) {
+        complaints = *recovered_complaints;
+        // Derive E solely from the recovered transcript, not a private view.
+        edges.clear();
+        for (auto& positions : edge_positions) positions.clear();
+        for (std::size_t j = 0; j < n; ++j) {
+            for (const std::size_t i : complaints[j]) {
+                edge_positions[j].push_back(edges.size());
+                edges.emplace_back(i, j);
+            }
+        }
+        std::vector<Record> vectors(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            if (public3[k].r_success) vectors[k] = public3[k].complete_vector;
+        }
+        p = decode_records(vectors, edges.size() * d, t, threshold, result);
+        qualified = p.has_value();
+        if (p) supporters = p->supporters;  // Keep all complete supporters.
+    }
+    if (qualified) {
+        Indices good;
+        for (std::size_t j = 0; j < n; ++j) {
+            std::vector<Record> vectors(n);
+            for (std::size_t k = 0; k < n; ++k) vectors[k] = public3[k].column_vectors[j];
+            const auto c = decode_records(vectors, complaints[j].size() * d, t, threshold, result);
+            if (!c || complaints[j].size() > t) continue;
+            Polynomial restriction;
+            for (std::size_t degree = 0; degree < d; ++degree) {
+                for (const std::size_t position : edge_positions[j]) {
+                    const auto begin = p->coefficients.begin() + degree * p->width + position * d;
+                    restriction.insert(restriction.end(), begin, begin + d);
+                }
+            }
+            if (restriction == c->coefficients) good.push_back(j);
+        }
+        if (good.size() < 2 * t + 1) qualified = false;
+        else {
+            for (std::size_t i = 0; i < n; ++i) {
+                std::size_t agreements = 0;
+                for (const std::size_t j : good) {
+                    if (!contains(complaints[j], i)) ++agreements;
+                }
+                (agreements >= 2 * t + 1 ? happy : unhappy).push_back(i);
+            }
+        }
+    }
+    result.supporters = supporters;
+    result.happy = happy;
+    result.unhappy = unhappy;
+
+    // Com_4 -> Com_5: status/selection broadcasts, public h0 repair shares,
+    // and all scalar evaluations of the independently sampled h1 shares.
+    std::vector<Forward4> forwards(n);
+    std::vector<Record> z(n * n * n * n);  // [i][k][l][v].
+    const auto z_index = [n](std::size_t i, std::size_t k, std::size_t l, std::size_t v) {
+        return ((i * n + k) * n + l) * n + v;
+    };
+    for (std::size_t l = 0; l < n; ++l) {
+        auto& outgoing = forwards[l];
+        outgoing.qualified = qualified;
+        outgoing.repair_shares.resize(n * n);
+        if (qualified) {
+            outgoing.supporters = supporters;
+            outgoing.unhappy = unhappy;
+            for (const std::size_t i : unhappy) {
+                for (std::size_t k = 0; k < n; ++k) {
+                    outgoing.repair_shares[i * n + k] = h0[h_index(i, k, l)];
+                }
+            }
+        }
+        if (faults.committee4 && l < t) {
+            outgoing.qualified = !qualified;
+            outgoing.supporters = std::nullopt;
+            outgoing.unhappy = std::nullopt;
+            std::fill(outgoing.repair_shares.begin(), outgoing.repair_shares.end(), std::nullopt);
+        }
+        // These two diagnostics intentionally omit records from t+1 Com_4
+        // senders, outside its corruption budget. They test default branches
+        // and do not assert the n > 3t security theorem in that execution.
+        if (faults.repair_failure_diagnostic && l <= t) {
+            std::fill(outgoing.repair_shares.begin(), outgoing.repair_shares.end(), std::nullopt);
+        }
+        if (faults.status_failure_diagnostic && l <= t) {
+            outgoing.qualified = std::nullopt;
+            outgoing.supporters = std::nullopt;
+            outgoing.unhappy = std::nullopt;
+        }
+        std::uint64_t public_bytes = outgoing.qualified ? 2 : 1;
+        if (outgoing.qualified.value_or(false)) {
+            public_bytes += outgoing.supporters ? 1 + set_bytes(*outgoing.supporters) : 1;
+            public_bytes += outgoing.unhappy ? 1 + set_bytes(*outgoing.unhappy) : 1;
+            if (outgoing.unhappy) {
+                for (const std::size_t i : *outgoing.unhappy) {
+                    for (std::size_t k = 0; k < n; ++k) public_bytes += record_bytes(outgoing.repair_shares[i * n + k]);
+                }
+            }
+        }
+        broadcast(result, public_bytes, n);
+        if (!qualified) continue;  // Honest roles forward only status.
+        for (std::size_t v = 0; v < n; ++v) {
+            for (std::size_t i = 0; i < n; ++i) {
+                for (std::size_t k = 0; k < n; ++k) {
+                    Record scalar;
+                    if (const auto share = valid_record(h1[h_index(i, k, l)], d)) {
+                        scalar = Polynomial{evaluate_polynomial(*share, points[v])};
+                    }
+                    if (faults.committee4 && l < t) {
+                        if (l % 2 == 0) scalar = std::nullopt;
+                        else if (scalar) (*scalar)[0] += Fp::one();
+                    }
+                    z[z_index(i, k, l, v)] = scalar;
+                    result.communication.p2p_bytes += record_bytes(scalar);
+                }
+            }
+        }
+    }
+
+    // Com_5 public checks and repair. Failed inner reconstructions remain
+    // erasures for complete-vector/outer decoding; they are never zeros.
+    std::vector<std::optional<bool>> statuses(n);
+    for (std::size_t l = 0; l < n; ++l) statuses[l] = forwards[l].qualified;
+    const auto status = majority(statuses, threshold);
+    if (!status) ++result.decoder_failures;
+    if (!status || !*status) return finish();
+    using Selection = std::pair<Indices, Indices>;
+    std::vector<std::optional<Selection>> selections(n);
+    for (std::size_t l = 0; l < n; ++l) {
+        const auto& message = forwards[l];
+        if (message.qualified.value_or(false) && message.supporters && message.unhappy
+            && valid_indices(*message.supporters, n) && valid_indices(*message.unhappy, n)
+            && message.supporters->size() >= threshold) {
+            selections[l] = std::make_pair(*message.supporters, *message.unhappy);
+        }
+    }
+    const auto selection = majority(selections, threshold);
+    if (!selection) {
+        ++result.decoder_failures;
+        return finish();
+    }
+    supporters = selection->first;
+    unhappy = selection->second;
+    happy.clear();
+    for (std::size_t i = 0; i < n; ++i) if (!contains(unhappy, i)) happy.push_back(i);
+    result.supporters = supporters;
+    result.happy = happy;
+    result.unhappy = unhappy;
+    std::optional<Decoded> repaired;
+    if (!unhappy.empty()) {
+        std::vector<Record> repair_vectors(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            Polynomial complete;
+            bool complete_valid = contains(supporters, k);
+            for (const std::size_t i : unhappy) {
+                std::vector<Record> shares(n);
+                for (std::size_t l = 0; l < n; ++l) shares[l] = forwards[l].repair_shares[i * n + k];
+                const auto secret = reconstruct_records(shares, d, t, threshold, result);
+                if (!secret) complete_valid = false;
+                else complete.insert(complete.end(), secret->begin(), secret->end());
+            }
+            if (complete_valid) repair_vectors[k] = std::move(complete);
+        }
+        repaired = decode_records(repair_vectors, unhappy.size() * d, t, threshold, result);
+        if (!repaired) return finish();
+        result.repaired_rows = unhappy.size();
+    }
+
+    result.qualified = true;
+    // Each final recipient uses only its own scalar messages plus the
+    // common repaired polynomials. The expected dealer polynomial is absent.
+    const Polynomial repaired_at_zero = repaired ? evaluate(*repaired, Fp::zero()) : Polynomial{};
+    for (std::size_t v = 0; v < n; ++v) {
+        std::vector<Record> row_values(n);
+        for (const std::size_t i : happy) {
+            std::vector<Record> k_values(n);
+            for (std::size_t k = 0; k < n; ++k) {
+                std::vector<Record> l_values(n);
+                for (std::size_t l = 0; l < n; ++l) l_values[l] = z[z_index(i, k, l, v)];
+                k_values[k] = reconstruct_records(l_values, 1, t, threshold, result);
+            }
+            row_values[i] = reconstruct_records(k_values, 1, t, threshold, result);
+        }
+        for (std::size_t position = 0; position < unhappy.size(); ++position) {
+            const auto begin = repaired_at_zero.begin() + position * d;
+            const Polynomial secret_z(begin, begin + d);
+            row_values[unhappy[position]] = Polynomial{evaluate_polynomial(secret_z, points[v])};
+        }
+        const auto share = reconstruct_records(row_values, 1, t, threshold, result);
+        result.shares[v] = share ? (*share)[0] : Fp::zero();
+    }
+    return finish();
+}
+
+}  // namespace fdvss::reference
