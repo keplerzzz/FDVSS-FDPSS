@@ -1,6 +1,7 @@
 #include "fdvss/reference.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -42,6 +43,25 @@ void fdvss1_reference_tests() {
             require(result.communication.broadcast_materialized_bytes
                     == n * result.communication.broadcast_native_bytes,
                     context + " inconsistent materialized broadcast count");
+            const std::vector<std::string> stages{"dealer", "com1", "com2", "com3", "com4", "com5"};
+            require(result.stages.size() == stages.size(), context + " missing timed phase");
+            Communication measured;
+            double elapsed = 0.0;
+            for (std::size_t phase = 0; phase < stages.size(); ++phase) {
+                const auto& sample = result.stages[phase];
+                require(sample.stage == stages[phase] && sample.n == n && sample.t == t,
+                        context + " invalid timed phase");
+                require(sample.milliseconds >= 0.0, context + " invalid duration");
+                elapsed += sample.milliseconds;
+                measured.p2p_bytes += sample.communication.p2p_bytes;
+                measured.broadcast_native_bytes += sample.communication.broadcast_native_bytes;
+                measured.broadcast_materialized_bytes += sample.communication.broadcast_materialized_bytes;
+            }
+            require(std::abs(elapsed - result.total_milliseconds) < 1e-8, context + " disconnected total time");
+            require(measured.p2p_bytes == result.communication.p2p_bytes
+                    && measured.broadcast_native_bytes == result.communication.broadcast_native_bytes
+                    && measured.broadcast_materialized_bytes == result.communication.broadcast_materialized_bytes,
+                    context + " unassigned message payload");
             if (scenario == "inconsistent-dealer" || scenario == "decoder-failure"
                 || scenario == "repair-decoder-failure-diagnostic"
                 || scenario == "status-quorum-failure-diagnostic") {

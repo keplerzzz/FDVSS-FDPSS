@@ -30,13 +30,13 @@ $(BUILD):
 $(CORE): src/core.cpp include/fdvss/core.hpp include/fdvss/field.hpp include/fdvss/digest.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/main.o: src/main.cpp include/fdvss/core.hpp | $(BUILD)
+$(BUILD)/main.o: src/main.cpp include/fdvss/core.hpp include/fdvss/payload.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/test_main.o: tests/test_main.cpp include/fdvss/core.hpp include/fdvss/field.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/reference_%.o: src/reference_%.cpp include/fdvss/reference.hpp include/fdvss/field.hpp | $(BUILD)
+$(BUILD)/reference_%.o: src/reference_%.cpp include/fdvss/reference.hpp include/fdvss/measurement.hpp include/fdvss/field.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/reference_test_%.o: tests/reference_%.cpp include/fdvss/reference.hpp | $(BUILD)
@@ -48,6 +48,9 @@ $(BUILD)/reference_test1.o: tests/reference1.cpp include/fdvss/reference.hpp | $
 $(BUILD)/reference_test2.o: tests/reference2.cpp include/fdvss/reference.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD)/payload_tests.o: tests/payload_tests.cpp include/fdvss/reference.hpp include/fdvss/payload.hpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
 $(BUILD)/fdvss_bench: $(CORE) $(BUILD)/main.o
 	$(CXX) $^ $(LDFLAGS) -o $@
 
@@ -57,7 +60,7 @@ $(BUILD)/fdvss_tests: $(CORE) $(BUILD)/test_main.o
 $(BUILD)/fdvss_reference: $(CORE) $(REFERENCE) $(BUILD)/reference_main.o
 	$(CXX) $^ $(LDFLAGS) -o $@
 
-$(BUILD)/reference_tests: $(CORE) $(REFERENCE) $(BUILD)/reference_test_main.o $(BUILD)/reference_test_algebra_tests.o $(BUILD)/reference_test_fdpss_tests.o $(BUILD)/reference_test1.o $(BUILD)/reference_test2.o
+$(BUILD)/reference_tests: $(CORE) $(REFERENCE) $(BUILD)/reference_test_main.o $(BUILD)/reference_test_algebra_tests.o $(BUILD)/reference_test_fdpss_tests.o $(BUILD)/reference_test1.o $(BUILD)/reference_test2.o $(BUILD)/payload_tests.o
 	$(CXX) $^ $(LDFLAGS) -o $@
 
 test: $(BUILD)/fdvss_tests $(BUILD)/reference_tests

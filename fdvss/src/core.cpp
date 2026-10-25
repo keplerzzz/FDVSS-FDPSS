@@ -143,7 +143,7 @@ std::vector<Fp> divide_by_linear(
     return quotient;
 }
 
-Digest256 digest_slice(
+Digest128 digest_slice(
     std::uint64_t sid,
     std::size_t i,
     std::size_t j,
@@ -160,7 +160,7 @@ Digest256 digest_slice(
     sha_update_u64(hash, salt[1]);
     sha_update_u64(hash, static_cast<std::uint64_t>(coefficients.size()));
     for (const Fp coefficient : coefficients) sha_update_u64(hash, coefficient.value());
-    return hash.finish();
+    return truncate128(hash.finish());
 }
 
 std::string json_escape(const std::string& input) {
@@ -318,7 +318,6 @@ std::vector<Fp> evaluate_matrix(
 
 RunRecord run_fdvss1_roles(const Config& raw_config) {
     Config config = raw_config;
-    if (config.t == 0 && config.n > 1) config.t = (config.n - 1) / 3;
     require_config(config);
     const std::size_t n = config.n;
     const std::size_t d = config.t + 1;
@@ -572,7 +571,6 @@ RunRecord run_fdvss1_roles(const Config& raw_config) {
 
 RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
     Config config = raw_config;
-    if (config.t == 0 && config.n > 1) config.t = (config.n - 1) / 3;
     require_config(config);
     const std::size_t n = config.n;
     const std::size_t d = config.t + 1;
@@ -590,7 +588,7 @@ RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
     std::vector<Fp> rows;       // [i][x][z]
     std::vector<Fp> slices;     // [i][j][z]
     std::vector<Salt> salts;    // [i][j]
-    std::vector<Digest256> digests;
+    std::vector<Digest128> digests;
 
     {
         StageSample stage = base_stage(config, record.protocol, record.mode, "dealer");
@@ -631,10 +629,10 @@ RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
             });
         });
         stage.peak_live_bytes = saturated_bytes({coefficients.size(), rows.size(), slices.size()}) +
-                                static_cast<std::uint64_t>(salts.size() * sizeof(Salt) + digests.size() * sizeof(Digest256));
+                                static_cast<std::uint64_t>(salts.size() * sizeof(Salt) + digests.size() * sizeof(Digest128));
         stage.communication.p2p_bytes = static_cast<std::uint64_t>(rows.size()) * sizeof(Fp) +
                                         static_cast<std::uint64_t>(salts.size()) * sizeof(Salt);
-        stage.communication.broadcast_native_bytes = static_cast<std::uint64_t>(digests.size()) * sizeof(Digest256);
+        stage.communication.broadcast_native_bytes = static_cast<std::uint64_t>(digests.size()) * sizeof(Digest128);
         stage.communication.broadcast_materialized_bytes = stage.communication.broadcast_native_bytes * n;
         stage.checksum = sampled_checksum(slices);
         stage.verified = !slices.empty() && !digests.empty();
@@ -668,7 +666,7 @@ RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
         const std::uint64_t record_bytes = static_cast<std::uint64_t>(d * sizeof(Fp) + sizeof(Salt));
         stage.communication.p2p_bytes = static_cast<std::uint64_t>(n) * record_bytes;
         stage.communication.broadcast_native_bytes =
-            static_cast<std::uint64_t>(digests.size()) * sizeof(Digest256);
+            static_cast<std::uint64_t>(digests.size()) * sizeof(Digest128);
         stage.communication.broadcast_materialized_bytes =
             stage.communication.broadcast_native_bytes * n;
         stage.checksum = sampled_checksum(party_slices);
@@ -710,10 +708,10 @@ RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
             forwarded_slices[(bad_i * n + bad_j) * d] += Fp::one();
         }
         stage.peak_live_bytes = saturated_bytes({rows.size(), forwarded_slices.size()}) +
-                                static_cast<std::uint64_t>(digests.size() * sizeof(Digest256));
+                                static_cast<std::uint64_t>(digests.size() * sizeof(Digest128));
         const std::uint64_t record_bytes = static_cast<std::uint64_t>(d * sizeof(Fp) + sizeof(Salt));
         stage.communication.p2p_bytes = static_cast<std::uint64_t>(n) * n * record_bytes;
-        stage.communication.broadcast_native_bytes = static_cast<std::uint64_t>(n) * digests.size() * sizeof(Digest256);
+        stage.communication.broadcast_native_bytes = static_cast<std::uint64_t>(n) * digests.size() * sizeof(Digest128);
         stage.communication.broadcast_materialized_bytes = stage.communication.broadcast_native_bytes * n;
         stage.checksum = std::accumulate(row_valid.begin(), row_valid.end(), std::uint64_t{0});
         stage.verified = std::all_of(row_valid.begin(), row_valid.end(), [](std::uint8_t value) { return value != 0; });
@@ -787,7 +785,7 @@ RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
         });
         stage.peak_live_bytes = saturated_bytes({n * d, d * d, n});
         stage.communication.p2p_bytes = static_cast<std::uint64_t>(n) * sizeof(Fp);
-        const std::uint64_t table_bytes = static_cast<std::uint64_t>(digests.size()) * sizeof(Digest256);
+        const std::uint64_t table_bytes = static_cast<std::uint64_t>(digests.size()) * sizeof(Digest128);
         stage.communication.broadcast_native_bytes = table_bytes + (n + 7) / 8 + sizeof(std::uint32_t);
         stage.communication.broadcast_materialized_bytes = stage.communication.broadcast_native_bytes * n;
         stage.checksum = sampled_checksum(z_local);
@@ -810,9 +808,9 @@ RunRecord run_fdvss2(const Config& raw_config, bool inject_fault) {
             });
         });
         stage.peak_live_bytes = saturated_bytes({forwarded_slices.size(), q_coefficients.size(), z_messages.size()}) +
-                                static_cast<std::uint64_t>(digests.size() * sizeof(Digest256));
+                                static_cast<std::uint64_t>(digests.size() * sizeof(Digest128));
         stage.communication.p2p_bytes = static_cast<std::uint64_t>(z_messages.size()) * sizeof(Fp);
-        const std::uint64_t table_bytes = static_cast<std::uint64_t>(digests.size()) * sizeof(Digest256);
+        const std::uint64_t table_bytes = static_cast<std::uint64_t>(digests.size()) * sizeof(Digest128);
         stage.communication.broadcast_native_bytes = static_cast<std::uint64_t>(n) *
             (table_bytes + (n + 7) / 8 + sizeof(std::uint32_t));
         stage.communication.broadcast_materialized_bytes = stage.communication.broadcast_native_bytes * n;
@@ -889,6 +887,9 @@ bool self_test(std::string* failure) {
             0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad
         };
         if (digest != expected) throw std::runtime_error("SHA-256 test vector mismatch");
+        Digest128 expected128{};
+        std::copy_n(expected.begin(), expected128.size(), expected128.begin());
+        if (truncate128(digest) != expected128) throw std::runtime_error("digest truncation mismatch");
 
         // Matrix evaluation/interpolation round trip.
         const std::size_t d = 4;
@@ -1003,7 +1004,7 @@ std::string system_fingerprint() {
 #endif
     output << "; hw_threads=" << std::thread::hardware_concurrency();
     output << "; field=goldilocks";
-    output << "; digest=sha256";
+    output << "; digest=sha256-128";
     return output.str();
 }
 

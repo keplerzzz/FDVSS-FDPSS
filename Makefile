@@ -14,6 +14,7 @@ native:
 check-shared:
 	cmp fdvss/include/fdvss/field.hpp fdpss/include/fdvss/field.hpp
 	cmp fdvss/include/fdvss/digest.hpp fdpss/include/fdvss/digest.hpp
+	cmp fdvss/include/fdvss/payload.hpp fdpss/include/fdvss/payload.hpp
 
 build/field_arithmetic: tests/field_arithmetic.cpp fdvss/include/fdvss/field.hpp
 	mkdir -p build

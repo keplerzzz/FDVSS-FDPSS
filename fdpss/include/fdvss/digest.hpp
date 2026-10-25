@@ -14,6 +14,13 @@
 namespace fdvss {
 
 using Digest256 = std::array<std::uint8_t, 32>;
+using Digest128 = std::array<std::uint8_t, 16>;
+
+inline Digest128 truncate128(const Digest256& digest) {
+    Digest128 result{};
+    std::memcpy(result.data(), digest.data(), result.size());
+    return result;
+}
 
 #if defined(__APPLE__)
 
@@ -37,8 +44,7 @@ class Sha256 {
 
 #else
 
-// Portable SHA-256 fallback. It is used only when a platform crypto primitive
-// is unavailable, keeping the experiment artifact dependency-free.
+// Portable SHA-256 fallback.
 class Sha256 {
   public:
     Sha256() = default;

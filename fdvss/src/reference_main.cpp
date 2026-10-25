@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
                           << "                       [--n N] [--t T] [--seed S]\n"
                           << "                       [--scenario all|NAME]\n\n"
                           << "Connected local reference execution with explicit messages.\n"
-                          << "This command is separate from the paper's timed kernels.\n";
+                          << "Fault-scenario correctness runner.\n";
                 for (const auto& name : fdvss::reference::fdvss1_scenarios())
                     std::cout << "fdvss1: " << name << '\n';
                 for (const auto& name : fdvss::reference::fdvss2_scenarios())
@@ -39,7 +39,6 @@ int main(int argc, char** argv) {
         }
         if (protocol != "fdvss1" && protocol != "fdvss2" && protocol != "fdpss2" && protocol != "both")
             throw std::invalid_argument("unsupported protocol");
-        // The transcript retains all committee messages; use small sizes for correctness.
         if (config.n < 1 || config.n > 32)
             throw std::invalid_argument("reference execution requires 1 <= n <= 32");
         if (!explicit_threshold && config.n > 1) config.t = (config.n - 1) / 3;
@@ -64,18 +63,8 @@ int main(int argc, char** argv) {
                     ? fdvss::reference::run_fdvss1(config, name)
                     : p == "fdvss2" ? fdvss::reference::run_fdvss2(config, name)
                                      : fdvss::reference::run_fdpss(config, name);
-                std::cout << p << " n=" << config.n << " t=" << config.t
-                          << " scenario=" << name
-                          << " qualified=" << result.qualified
-                          << " verified=" << result.verified
-                          << " complaints=" << result.complaints
-                          << " certificates=" << result.certificates
-                          << " invalid_certificates=" << result.invalid_certificates
-                          << " repaired_rows=" << result.repaired_rows
-                          << " decoder_failures=" << result.decoder_failures
-                          << " native_payload_bytes="
-                          << result.communication.p2p_bytes +
-                             result.communication.broadcast_native_bytes << '\n';
+                std::cout << p << " scenario=" << name
+                          << (result.verified ? " passed" : " failed") << '\n';
                 verified &= result.verified;
             }
         }

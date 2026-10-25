@@ -1,5 +1,6 @@
 #include "fdvss/reference.hpp"
 #include "fdvss/digest.hpp"
+#include "fdvss/measurement.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,10 +13,9 @@ namespace {
 
 using Bytes = std::vector<std::uint8_t>;
 using Salt = std::array<std::uint64_t, 2>;
-using Table = std::vector<Digest256>;
+using Table = std::vector<Digest128>;
 
-// Fixed little-endian integers, explicit counts, and one-byte optional tags.
-// Parsers reject extra bytes, invalid dimensions, and noncanonical fields.
+// Canonical little-endian messages.
 struct Writer {
     Bytes bytes;
     void byte(std::uint8_t value) { bytes.push_back(value); }
@@ -218,7 +218,7 @@ Record parse_scalar(const Bytes& bytes) {
     return reader.finished() ? Record(Polynomial{value}) : std::nullopt;
 }
 
-Digest256 digest_slice(std::uint64_t sid, std::size_t i, std::size_t j, const Slice& slice) {
+Digest128 digest_slice(std::uint64_t sid, std::size_t i, std::size_t j, const Slice& slice) {
     static constexpr char domain[] = "FDVSS-2/slice/v1";
     Sha256 hash;
     hash.update(domain, sizeof(domain) - 1);
@@ -229,7 +229,7 @@ Digest256 digest_slice(std::uint64_t sid, std::size_t i, std::size_t j, const Sl
     sha_update_u64(hash, slice.salt[1]);
     sha_update_u64(hash, slice.polynomial.size());
     for (const auto value : slice.polynomial) sha_update_u64(hash, value.value());
-    return hash.finish();
+    return truncate128(hash.finish());
 }
 
 Polynomial row_at(const Row& row, Fp point, std::size_t d) {
@@ -309,7 +309,7 @@ std::vector<std::string> fdvss2_scenarios() {
             "missing-z", "malformed-z", "insufficient-records-diagnostic"};
 }
 
-Result run_fdvss2(const Config& config, const std::string& scenario) {
+Result run_fdvss2(const Config& config, const std::string& scenario, bool verify) {
     const auto scenarios = fdvss2_scenarios();
     if (std::find(scenarios.begin(), scenarios.end(), scenario) == scenarios.end()) {
         throw std::invalid_argument("unknown FDVSS-2 reference scenario: " + scenario);
@@ -321,6 +321,7 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
     Result result;
     result.protocol = "fdvss2";
     result.scenario = scenario;
+    Measurement measurement(result, config);
     result.shares.resize(n, Fp::zero());
     SplitMix64 random(config.seed);
     const std::uint64_t sid = random.next_u64();
@@ -329,7 +330,6 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
     const Fp secret = coefficients[0];
     const auto points = evaluation_points(n);
 
-    // Dealer: generate private rows and authenticate exactly the sent slices.
     std::vector<Row> dealer_rows(n);
     for (std::size_t i = 0; i < n; ++i) {
         auto& row = dealer_rows[i];
@@ -342,8 +342,6 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
         for (auto& salt : row.salts) for (auto& word : salt) word = random.next_u64();
     }
     if (scenario == "inconsistent-dealer" && n > d) {
-        // Every private row still has degree at most t in X and Z. The extra
-        // row disagrees with the unique W interpolant through the first t+1.
         dealer_rows[d].coefficients[0] += Fp::one();
     }
     Table dealer_table(n * n);
@@ -369,7 +367,8 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
         point_to_point(result, dealer_private[i]);
     }
 
-    // Com1: a full-row check controls both its broadcast and private messages.
+    measurement.stage("dealer");
+
     std::vector<Bytes> com1_broadcast(n);
     std::vector<std::vector<Bytes>> slices(n, std::vector<Bytes>(n));  // [recipient j][sender i]
     for (std::size_t i = 0; i < n; ++i) {
@@ -403,8 +402,8 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
         }
     }
 
-    // Com2: retain original wire openings so a witness cannot accidentally
-    // contain reconstructed or normalized values instead of authenticated ones.
+    measurement.stage("com1");
+
     std::vector<Bytes> com2_broadcast(n);
     std::vector<std::vector<Bytes>> final_messages(n, std::vector<Bytes>(n));  // [v][j]
     for (std::size_t j = 0; j < n; ++j) {
@@ -473,8 +472,8 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
         }
     }
 
-    // Com3: every final recipient recovers the public pair, validates all
-    // witnesses, and independently robustly decodes its received z messages.
+    measurement.stage("com2");
+
     std::vector<bool> qualified(n, true);
     for (std::size_t v = 0; v < n; ++v) {
         const auto pair = recover_pair(com2_broadcast, n, t);
@@ -501,13 +500,14 @@ Result run_fdvss2(const Config& config, const std::string& scenario) {
         else ++result.decoder_failures;
     }
     result.qualified = qualified[0];
+    measurement.stage("com3");
+    if (!verify) return result;
     result.verified = std::all_of(qualified.begin(), qualified.end(), [&](bool status) { return status == result.qualified; });
     for (std::size_t v = 0; v < n; ++v) {
         Polynomial expected_polynomial(coefficients.begin(), coefficients.begin() + d);
         const auto expected = result.qualified ? evaluate_polynomial(expected_polynomial, points[v]) : Fp::zero();
         result.verified = result.verified && result.shares[v] == expected;
     }
-    // Check the secret separately from the protocol's qualification decisions.
     if (result.qualified) {
         std::vector<Record> outputs(n);
         for (std::size_t v = 0; v < n; ++v) outputs[v] = Polynomial{result.shares[v]};

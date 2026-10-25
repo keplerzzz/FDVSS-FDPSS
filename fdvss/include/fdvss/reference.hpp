@@ -41,7 +41,9 @@ struct Result {
     std::size_t invalid_certificates = 0;
     std::size_t repaired_rows = 0;
     std::size_t decoder_failures = 0;
-    Communication communication;  // Aggregate logical transcript payload.
+    Communication communication;
+    std::vector<StageSample> stages;
+    double total_milliseconds = 0.0;
 };
 
 // Connected local committee executions with explicit messages and erasures.
@@ -50,7 +52,7 @@ struct Result {
 [[nodiscard]] std::vector<std::string> fdvss2_scenarios();
 [[nodiscard]] std::vector<std::string> fdpss_scenarios();
 [[nodiscard]] Result run_fdvss1(const Config& config, const std::string& scenario);
-[[nodiscard]] Result run_fdvss2(const Config& config, const std::string& scenario);
+[[nodiscard]] Result run_fdvss2(const Config& config, const std::string& scenario, bool verify = true);
 [[nodiscard]] Result run_fdpss(const Config& config, const std::string& scenario);
 
 }  // namespace fdvss::reference

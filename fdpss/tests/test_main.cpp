@@ -38,6 +38,15 @@ int main() {
             return 1;
         }
     }
+    fdvss::Config zero_threshold;
+    zero_threshold.n = 4;
+    zero_threshold.t = 0;
+    zero_threshold.threads = 2;
+    const auto zero = fdvss::run_fdpss(zero_threshold);
+    if (!zero.verified || zero.t != 0) {
+        std::cerr << "zero-threshold transition failed\n";
+        return 1;
+    }
     std::cout << "all tests passed\n";
     return 0;
 }

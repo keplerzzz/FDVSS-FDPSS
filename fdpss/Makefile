@@ -29,7 +29,7 @@ $(BUILD):
 $(CORE): src/core.cpp include/fdvss/core.hpp include/fdvss/field.hpp include/fdvss/digest.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/main.o: src/main.cpp include/fdvss/core.hpp | $(BUILD)
+$(BUILD)/main.o: src/main.cpp include/fdvss/core.hpp include/fdvss/payload.hpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/test_main.o: tests/test_main.cpp include/fdvss/core.hpp include/fdvss/field.hpp | $(BUILD)

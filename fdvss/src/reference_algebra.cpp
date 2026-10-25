@@ -60,8 +60,7 @@ std::optional<Polynomial> solve(std::vector<Polynomial> matrix, std::size_t vari
     return solution;
 }
 
-// Monic Berlekamp-Welch locator of degree errors. A rank-deficient locator
-// still gives the same quotient within the unique-decoding radius.
+// A monic locator also covers rank-deficient unique-decoding systems.
 std::optional<Polynomial> decode_coordinate(
     const std::vector<Record>& values, const Available& available,
     std::size_t coordinate, std::size_t t, std::size_t errors
@@ -98,6 +97,60 @@ std::optional<Polynomial> decode_coordinate(
     return quotient;
 }
 
+Decoded interpolate_basis(const std::vector<Record>& values, const Available& available, std::size_t t) {
+    const std::size_t d = t + 1;
+    struct Plan {
+        std::vector<std::size_t> indices;
+        std::vector<Fp> points;
+        std::vector<Fp> inverses;
+    };
+    thread_local Plan plan;
+    const std::vector<std::size_t> indices(available.indices.begin(), available.indices.begin() + d);
+    if (plan.indices != indices) {
+        plan.indices = indices;
+        plan.points.clear();
+        for (const auto i : indices) plan.points.push_back(Fp::from_u64(i + 1));
+        std::vector<Fp> denominators;
+        for (std::size_t order = 1; order < d; ++order) {
+            for (std::size_t k = d; k-- > order;) denominators.push_back(plan.points[k] - plan.points[k - order]);
+        }
+        plan.inverses = batch_inverse(denominators);
+    }
+    std::vector<Polynomial> differences;
+    differences.reserve(d);
+    for (std::size_t k = 0; k < d; ++k) {
+        differences.push_back(*values[available.indices[k]]);
+    }
+    std::size_t position = 0;
+    for (std::size_t order = 1; order < d; ++order) {
+        for (std::size_t k = d; k-- > order;) {
+            const Fp inverse = plan.inverses[position++];
+            for (std::size_t coordinate = 0; coordinate < available.width; ++coordinate) {
+                differences[k][coordinate] = (differences[k][coordinate] - differences[k - 1][coordinate]) * inverse;
+            }
+        }
+    }
+    Decoded result{Polynomial(d * available.width, Fp::zero()), {}, available.width};
+    Polynomial basis{Fp::one()};
+    for (std::size_t k = 0; k < d; ++k) {
+        for (std::size_t degree = 0; degree < basis.size(); ++degree) {
+            for (std::size_t coordinate = 0; coordinate < available.width; ++coordinate) {
+                result.coefficients[degree * available.width + coordinate] += basis[degree] * differences[k][coordinate];
+            }
+        }
+        Polynomial next(basis.size() + 1, Fp::zero());
+        for (std::size_t degree = 0; degree < basis.size(); ++degree) {
+            next[degree] -= plan.points[k] * basis[degree];
+            next[degree + 1] += basis[degree];
+        }
+        basis = std::move(next);
+    }
+    for (const std::size_t i : available.indices) {
+        if (evaluate(result, Fp::from_u64(i + 1)) == *values[i]) result.supporters.push_back(i);
+    }
+    return result;
+}
+
 }  // namespace
 
 Polynomial evaluate(const Decoded& polynomial, Fp point) {
@@ -129,11 +182,12 @@ std::optional<Decoded> decode(
     if (available->width == 0) return Decoded{{}, available->indices, 0};
     if (required_support <= t) return std::nullopt;
     const std::size_t errors = count - required_support;
-    // Equivalent to count >= t + 2*errors + 1, without overflowing.
     if (errors > (count - t - 1) / 2) return std::nullopt;
     if (available->width != 0 && t + 1 > std::numeric_limits<std::size_t>::max() / available->width) {
         return std::nullopt;
     }
+    auto candidate = interpolate_basis(values, *available, t);
+    if (candidate.supporters.size() >= required_support) return candidate;
     Decoded result;
     result.width = available->width;
     result.coefficients.resize((t + 1) * result.width, Fp::zero());
@@ -144,8 +198,7 @@ std::optional<Decoded> decode(
             result.coefficients[degree * result.width + coordinate] = (*scalar)[degree];
         }
     }
-    // Coordinates cannot choose different supporter sets: authenticate the
-    // entire tuple against one vector polynomial after scalar decoding.
+    // Every coordinate must have the same complete-record supporter set.
     for (const std::size_t i : available->indices) {
         if (evaluate(result, Fp::from_u64(i + 1)) == *values[i]) result.supporters.push_back(i);
     }
